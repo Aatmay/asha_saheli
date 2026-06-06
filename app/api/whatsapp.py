@@ -1,8 +1,10 @@
+import os
 import time
 import requests
 from fastapi import APIRouter, Request, Response, BackgroundTasks, HTTPException
 from app.core.config import settings
 
+# The prefix here handles the "/whatsapp" part of the URL structure
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp Webhook"])
 
 def send_instant_acknowledgement(to_number: str, message_body: str):
@@ -51,10 +53,15 @@ async def verify_webhook(request: Request):
     token = params.get("hub.verify_token")
     challenge = params.get("hub.challenge")
 
-    if mode == "subscribe" and token == settings.VERIFY_TOKEN:
-        print("Webhook verified successfully.")
-        return Response(content=challenge, media_type="text/plain")
+    local_token = getattr(settings, "VERIFY_TOKEN", None) or os.getenv("VERIFY_TOKEN")
+
+    if mode == "subscribe" and token == local_token:
+        print("--- WEBHOOK VERIFIED SUCCESSFULLY ---")
+        response = Response(content=challenge, media_type="text/plain")
+        response.headers["ngrok-skip-browser-warning"] = "1"
+        return response
     
+    print(f"--- VERIFICATION FAILED --- Got: '{token}', Expected: '{local_token}'")
     raise HTTPException(status_code=403, detail="Verification failed; token mismatch.")
 
 
