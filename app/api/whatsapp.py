@@ -6,28 +6,25 @@ from sqlalchemy.orm import Session
 from google import genai
 from dotenv import load_dotenv
 
-# Import database sessions and structures
+# Database & Routing Interfaces
 from app.database.database import get_local_db, get_postgres_db
 from app.database import models
 from app.database.vector_db import query_knowledge_corpus
-from router import route_incoming_intent
+from router import route_contextual_intent
 
 load_dotenv()
 
 router = APIRouter()
 
-# --- INCENTIVE TRACKER RULE ENGINE CONFIGURATION ---
-# Deterministic real-world government payout mappings to eliminate LLM math calculation errors
 TASK_PAYOUTS = {
-    "ANC_REGISTRATION": 300.0,       # Rupee award for an Antenatal Care registration
-    "IMMUNIZATION_COMPLETE": 150.0,  # Rupee award for delivering a full vaccination schedule
-    "INSTITUTIONAL_DELIVERY": 500.0, # Rupee award for facilitating hospital institutional births
-    "HIGH_RISK_REFERRAL": 200.0       # Rupee award for routing high-risk cases to medical facilities
+    "ANC_REGISTRATION": 300.0,
+    "IMMUNIZATION_COMPLETE": 150.0,
+    "INSTITUTIONAL_DELIVERY": 500.0,
+    "HIGH_RISK_REFERRAL": 200.0
 }
 
 @router.get("/whatsapp/webhook")
 async def verify_webhook(request: Request):
-    """Handles the initial security handshake authentication challenge with Meta Cloud API."""
     params = request.query_params
     mode = params.get("hub.mode")
     token = params.get("hub.verify_token")
@@ -44,36 +41,30 @@ async def receive_whatsapp_message(
     sqlite_db: Session = Depends(get_local_db),
     postgres_db: Session = Depends(get_postgres_db)
 ):
-    """
-    Main ingestion endpoint processing active WhatsApp message packets from health workers,
-    routing them by programmatic intent, and saving patient/incentive data metrics.
-    """
     payload = await request.json()
     
-    # 1. Parse inbound sender details out of the Meta context layout envelope
     try:
         entry = payload.get("entry", [])[0]
         changes = entry.get("changes", [])[0]
         value = changes.get("value", {})
         message = value.get("messages", [])[0]
         
-        sender_phone = message.get("from") # The target ASHA worker's identity key
+        sender_phone = message.get("from")
         
-        # Capture raw user prompt whether text or parsed voice transcription asset
         incoming_text = ""
         if message.get("type") == "text":
             incoming_text = message.get("text", {}).get("body", "")
         elif message.get("type") == "audio":
-            # For Audio Integration Pipeline: fallback until Bhashini IndicASR endpoint hook is live
             incoming_text = "[Voice Input Captured]" 
             
         if not incoming_text:
             return {"status": "ignored", "reason": "Empty text frame"}
             
     except (IndexError, KeyError, TypeError):
-        return {"status": "ignored", "reason": "Malformed webhook structure payload packet"}
+        return {"status": "ignored", "reason": "Malformed webhook structure"}
 
-    # Check if the ASHA worker profile exists in our local database, onboard automatically if missing
+    # --- STATE HISTORY BRIDGE CONFIGURATION (SQLite Private Registry) ---
+    # Ensure ASHA profile exists
     worker = sqlite_db.query(models.AshaWorker).filter(models.AshaWorker.phone_number == sender_phone).first()
     if not worker:
         worker = models.AshaWorker(phone_number=sender_phone, name="Asha Worker", village_name="Pilot Village")
@@ -81,64 +72,79 @@ async def receive_whatsapp_message(
         sqlite_db.commit()
         sqlite_db.refresh(worker)
 
-    # 2. ENGAGE COGNITIVE INTENT ROUTER LAYER
-    # Pass prompt context to Gemini Flash structured schema engine to evaluate user task context
-    routing_result = route_incoming_intent(incoming_text)
-    print(f"--- ROUTING ENGAGED --- Intent detected: {routing_result.intent} | Reason: {routing_result.reason}")
+    # Fetch running conversational session tracking history
+    session = sqlite_db.query(models.ChatSessionState).filter(models.ChatSessionState.asha_phone == sender_phone).first()
+    if not session:
+        session = models.ChatSessionState(asha_phone=sender_phone, last_detected_patient=None, last_detected_intent="GENERAL")
+        sqlite_db.add(session)
+        sqlite_db.commit()
+        sqlite_db.refresh(session)
 
-    # 3. RUN DATABASE AND INCENTIVE ACTIONS BASED ON INTENT MATCH
+    # Try to extract patient name dynamically if mentioned explicitly in the text
+    # Simple extraction logic for prototype validation
+    for word in incoming_text.split():
+        if word.istitle() and word.lower() not in ["i", "my", "asha", "patient", "ok", "treatment"]:
+            session.last_detected_patient = word
+            sqlite_db.commit()
+
+    # Pack memory variables to contextualize the routing prompt
+    memory_snapshot = f"Last Patient Named: {session.last_detected_patient} | Prior State Intent: {session.last_detected_intent}"
+
+    # ENGAGE CONTEXTUAL INTENT ROUTER LAYER
+    routing_result = route_contextual_intent(incoming_text, session_context=memory_snapshot)
+    print(f"--- CHAINED ROUTING ACTIVE --- Intent: {routing_result.intent} | History State: {memory_snapshot}")
+
     response_message = ""
     
-    # --- ROUTE A: INCENTIVE EXTRACTION & DOCUMENTATION ---
+    # --- ROUTE A: INCENTIVE EXTRACTION & RECORDING ---
     if routing_result.intent == "INCENTIVE_TRACKER":
-        # Check text contents to match the right task type
-        task_detected = "ANC_REGISTRATION" # Fallback baseline
+        task_detected = "ANC_REGISTRATION"
         
         if "delivery" in incoming_text.lower() or "प्रसव" in incoming_text:
             task_detected = "INSTITUTIONAL_DELIVERY"
-        elif "vaccine" in incoming_text.lower() or "टीका" in incoming_text or "टीकाकरण" in incoming_text:
+        elif "vaccine" in incoming_text.lower() or "टीका" in incoming_text:
             task_detected = "IMMUNIZATION_COMPLETE"
-        elif "referral" in incoming_text.lower() or "रेफर" in incoming_text:
+        elif "appointment" in incoming_text.lower() or "treatment" in incoming_text or "रेफर" in incoming_text:
             task_detected = "HIGH_RISK_REFERRAL"
 
         reward_amount = TASK_PAYOUTS.get(task_detected, 0.0)
         
-        # Step 1: Update the ASHA running transaction ledger in local SQLite cache
+        # 1. Update running budget metrics locally
         worker.total_incentives_earned += reward_amount
-        sqlite_db.commit()
         
-        # Step 2: Log patient profile demographics into centralized PostgreSQL backend storage
+        # 2. Resolve target patient name using our Session Memory fallbacks
+        resolved_patient = session.last_detected_patient if session.last_detected_patient else "Unknown Patient"
+        
+        # 3. Commit clean transaction record data straight to PostgreSQL Warehouse storage
         new_patient = models.PatientRecord(
             asha_phone=sender_phone,
-            patient_name=f"Patient Registered via {task_detected}",
-            age=25,
-            risk_status="Normal"
+            patient_name=resolved_patient,
+            age=26,
+            risk_status=f"Action Logged: {task_detected}"
         )
         postgres_db.add(new_patient)
-        postgres_db.commit()
+        
+        # Update Session Log Context variables
+        session.last_detected_intent = "INCENTIVE_TRACKER"
+        sqlite_db.commit()
         
         response_message = (
-            f"नमस्ते आशा दीदी! आपका कार्य सफलतापुर्वक दर्ज कर लिया गया है।\n\n"
-            f"💰 इस कार्य के लिए आपका इंसेंटिव: ₹{reward_amount}\n"
-            f"📈 इस महीने का आपका कुल इंसेंटिव अब: ₹{worker.total_incentives_earned} हो गया है!"
+            f"नमस्ते आशा दीदी! मरीज '{resolved_patient}' के लिए आपका कार्य दर्ज कर लिया गया है।\n\n"
+            f"💰 इस कार्य का इंसेंटिव: ₹{reward_amount}\n"
+            f"📈 इस महीने का आपका कुल बैलेंस: ₹{worker.total_incentives_earned} हो गया है!"
         )
 
-    # --- ROUTE B: CLINICAL GUIDELINE PROTOCOL LOOKUP (STG MIRROR) ---
+    # --- ROUTE B: CLINICAL PROTOCOL LOOKUP (STG MIRROR RAG) ---
     elif routing_result.intent == "STG_MIRROR":
-        # Step 1: Pull relevant clinical handbook guidelines out of your Pinecone Vector Database
         relevant_guidelines = query_knowledge_corpus(incoming_text, top_k=2)
-        context_str = "\n".join(relevant_guidelines) if relevant_guidelines else "No specific guideline text found in corpus."
+        context_str = "\n".join(relevant_guidelines) if relevant_guidelines else "No explicit guidelines found."
         
-        # Step 2: Synthesize a clean, grounded conversational answer using Gemini 2.5 Flash
         try:
             client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-            
             system_instruction = (
-                "You are Asha Saheli, a medical guidelines assistant. Use the provided National Health Mission "
-                "guidelines context to answer the user's question accurately in simple, friendly spoken Hindi. "
-                "Do not make up medical facts. If unsure, tell her to refer the patient to the nearest medical officer."
+                "You are Asha Saheli, a medical guidelines helper. Answer accurately using only the provided National Health Mission "
+                "guidelines text context in clear, friendly spoken Hindi. Always advise her to forward emergencies to a doctor."
             )
-            
             prompt = f"Guidelines Context:\n{context_str}\n\nASHA Worker Question: {incoming_text}"
             
             ai_response = client.models.generate_content(
@@ -147,26 +153,27 @@ async def receive_whatsapp_message(
                 config={'system_instruction': system_instruction}
             )
             response_message = ai_response.text
-        except Exception as gemini_err:
-            print(f"Gemini Synthesis Exception: {gemini_err}")
-            response_message = "नमस्ते आशा दीदी! तकनीकी समस्या के कारण मैं अभी जानकारी नहीं निकाल पा रही हूँ। कृपया थोड़ी देर बाद प्रयास करें।"
+            
+            # Update history state
+            session.last_detected_intent = "STG_MIRROR"
+            sqlite_db.commit()
+            
+        except Exception as e:
+            print(f"Gemini Error: {e}")
+            response_message = "नमस्ते आशा दीदी! सर्वर में समस्या के कारण मैं अभी जानकारी नहीं निकाल पा रही हूँ।"
 
-    # --- ROUTE C: CONVERSATIONAL GENERAL PROCESSING ---
+    # --- ROUTE C: GENERAL CONVERSATIONAL PROCESSING ---
     else:
-        response_message = (
-            f"नमस्ते आशा दीदी! मैं आपकी 'आशा सहेली' हूँ।\n\n"
-            f"आप मुझसे अपने काम का रिकॉर्ड दर्ज करा सकती हैं (जैसे कि ANC रजिस्ट्रेशन या डिलीवरी) "
-            f"या फिर किसी बीमारी के इलाज के सरकारी नियम पूछ सकती हैं। आज मैं आपकी क्या मदद करूँ?"
-        )
+        response_message = "नमस्ते आशा दीदी! मैं आपकी आशा सहेली हूँ। आज काम के रिकॉर्ड्स या इंसेंटिव ट्रैकिंग में मैं आपकी क्या मदद करूँ?"
+        session.last_detected_intent = "GENERAL"
+        sqlite_db.commit()
 
-    # 4. DISPATCH OUTBOUND WHATSAPP FRAME BACK TO SENDER PHONE
+    # Dispatch frame payload out to gateway
     send_whatsapp_message_payload(sender_phone, response_message)
-
     return {"status": "processed", "intent": routing_result.intent}
 
 
 def send_whatsapp_message_payload(recipient_phone: str, text_body: str):
-    """Dispatches outgoing text strings to the Meta Graph API gateway endpoint securely."""
     url = f"https://graph.facebook.com/v18.0/{os.getenv('PHONE_NUMBER_ID')}/messages"
     headers = {
         "Authorization": f"Bearer {os.getenv('WHATSAPP_TOKEN')}",
@@ -181,6 +188,6 @@ def send_whatsapp_message_payload(recipient_phone: str, text_body: str):
     try:
         res = requests.post(url, json=data, headers=headers)
         if res.status_code != 200:
-            print(f"Meta Gateway Outbound Error Code: {res.status_code} | Log: {res.text}")
-    except Exception as network_error:
-        print(f"Outbound Delivery Pipeline Exception Failed: {network_error}")
+            print(f"Meta Cloud API Gateway Error: {res.text}")
+    except Exception as e:
+        print(f"Network Pipeline Exception Failed: {e}")
