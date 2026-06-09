@@ -3,6 +3,11 @@ import time
 import random  # Required to inject jitter metrics into the exponential retry calculation
 import requests
 import uvicorn
+import models
+from database import sqlite_engine
+
+# Automatically creates the local SQLite database file and tables on app startup
+models.Base.metadata.create_all(bind=sqlite_engine)
 from fastapi import FastAPI, Request, Response, BackgroundTasks, HTTPException
 from dotenv import load_dotenv
 from google import genai
