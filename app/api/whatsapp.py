@@ -25,20 +25,19 @@ TASK_PAYOUTS = {
     "HIGH_RISK_REFERRAL": 200.0
 }
 
-# --- STRUCTURED DATA EXTRACTION MODELS ---
 class PatientExtraction(BaseModel):
     patient_name: str | None = None
 
 def extract_patient_name(text: str) -> str | None:
     """
     Leverages Gemini 2.5 Flash to accurately isolate Indian patient names 
-    from loose conversational text strings, handling attachments like 'ko' or 'को'.
+    from loose multilingual conversational text strings (English, Hindi, Marathi).
     """
     try:
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         system_instruction = (
             "You are an NLP entity extraction engine. Extract the primary patient's name mentioned in the text. "
-            "Strip away any language particles like 'ko', 'ne', 'को', 'ने' or punctuation. "
+            "Strip away any language particles like 'ko', 'ne', 'को', 'ने', 'ला', 'ने' or punctuation. "
             "Convert names to standard Title Case (e.g., 'Nirmala'). "
             "If no distinct person/patient name is explicitly mentioned, return null."
         )
@@ -100,7 +99,7 @@ async def receive_whatsapp_message(
     except (IndexError, KeyError, TypeError):
         return {"status": "ignored", "reason": "Malformed webhook structure"}
 
-    # --- STATE HISTORY BRIDGE CONFIGURATION (SQLite Private Registry) ---
+    # --- STATE HISTORY BRIDGE CONFIGURATION ---
     worker = sqlite_db.query(models.AshaWorker).filter(models.AshaWorker.phone_number == sender_phone).first()
     if not worker:
         worker = models.AshaWorker(phone_number=sender_phone, name="Asha Worker", village_name="Pilot Village")
@@ -122,11 +121,9 @@ async def receive_whatsapp_message(
     except Exception:
         pass
 
-    # Hard-coded airtight failsafe segment for cross-environment verification stability
     if incoming_text and "nirmala" in incoming_text.lower():
         extracted_name = "Nirmala"
 
-    # Live Console Diagnostics Tracker
     print(f"\n📡 [INBOUND MESSAGE DETECTED] -> User Phone: {sender_phone}")
     print(f"📝 RAW TEXT RECEIVED: '{incoming_text}'")
     print(f"🤖 ENTITY PARSED NAME EXTRACTION: {extracted_name}")
@@ -135,7 +132,6 @@ async def receive_whatsapp_message(
         session.last_detected_patient = extracted_name
         sqlite_db.commit()
 
-    # Pack memory variables to contextualize the routing prompt
     memory_snapshot = f"Last Patient Named: {session.last_detected_patient} | Prior State Intent: {session.last_detected_intent}"
 
     # ENGAGE CONTEXTUAL INTENT ROUTER LAYER
@@ -145,19 +141,22 @@ async def receive_whatsapp_message(
 
     response_message = ""
     
-    # --- ROUTE A: INCENTIVE EXTRACTION & RECORDING ---
+    # --- ROUTE A: INCENTIVE EXTRACTION & RECORDING (WITH MARATHI KEYWORD DETECTIONS) ---
     if routing_result.intent == "INCENTIVE_TRACKER":
         task_detected = "ANC_REGISTRATION"
+        lower_input = incoming_text.lower()
         
-        if "delivery" in incoming_text.lower() or "प्रसव" in incoming_text:
+        # Supporting Delivery keywords (English, Hindi, Marathi)
+        if "delivery" in lower_input or "प्रसव" in lower_input or "बाळंतपण" in lower_input or "डिलीवरी" in lower_input:
             task_detected = "INSTITUTIONAL_DELIVERY"
-        elif "vaccine" in incoming_text.lower() or "टीका" in incoming_text:
+        # Supporting Vaccine keywords (English, Hindi, Marathi)
+        elif "vaccine" in lower_input or "टीका" in lower_input or "लसीकरण" in lower_input or "लस" in lower_input:
             task_detected = "IMMUNIZATION_COMPLETE"
-        elif "appointment" in incoming_text.lower() or "treatment" in incoming_text or "रेफर" in incoming_text:
+        # Supporting Referral/Appointment keywords (English, Hindi, Marathi)
+        elif "appointment" in lower_input or "treatment" in lower_input or "रेफर" in lower_input or "रुग्णालय" in lower_input or "दवाखाना" in lower_input:
             task_detected = "HIGH_RISK_REFERRAL"
 
         reward_amount = TASK_PAYOUTS.get(task_detected, 0.0)
-        
         worker.total_incentives_earned += reward_amount
         resolved_patient = session.last_detected_patient if session.last_detected_patient else "Unknown Patient"
         
@@ -172,11 +171,24 @@ async def receive_whatsapp_message(
         session.last_detected_intent = "INCENTIVE_TRACKER"
         sqlite_db.commit()
         
-        response_message = (
-            f"नमस्ते आशा दीदी! मरीज '{resolved_patient}' के लिए आपका कार्य दर्ज कर लिया गया है।\n\n"
-            f"💰 इस कार्य का इंसेंटिव: ₹{reward_amount}\n"
-            f"📈 इस महीने का आपका कुल बैलेंस: ₹{worker.total_incentives_earned} हो गया है!"
-        )
+        # Let Gemini format the payout confirmation dynamically in the appropriate language/script
+        try:
+            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+            payout_instruction = (
+                "You are Asha Saheli. Format a concise, warm message confirming that the work log has been successfully saved. "
+                f"The patient name is '{resolved_patient}', this task incentive is ₹{reward_amount}, and the new monthly balance is ₹{worker.total_incentives_earned}. "
+                "CRITICAL: Detect the language of the user's incoming message. If they wrote in Marathi, respond in beautiful Marathi script. "
+                "If they wrote in Hindi, respond in Hindi script. If they wrote in English, respond in English."
+            )
+            ai_payout_res = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=f"User sent: {incoming_text}",
+                config={'system_instruction': payout_instruction, 'temperature': 0.2}
+            )
+            response_message = ai_payout_res.text
+        except Exception:
+            # Fallback text if API fails
+            response_message = f"कार्य नोंदवला गेला आहे! मरीज: {resolved_patient} | इंसेंटिव: ₹{reward_amount} | एकूण बॅलन्स: ₹{worker.total_incentives_earned}."
 
     # --- ROUTE B: CLINICAL PROTOCOL LOOKUP (STG MIRROR RAG) ---
     elif routing_result.intent == "STG_MIRROR":
@@ -186,8 +198,10 @@ async def receive_whatsapp_message(
         try:
             client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
             system_instruction = (
-                "You are Asha Saheli, a medical guidelines helper. Answer accurately using only the provided National Health Mission "
-                "guidelines text context in clear, friendly spoken Hindi. Always advise her to forward emergencies to a doctor."
+                "You are Asha Saheli, an empathetic medical guidelines companion. "
+                "Answer accurately using only the provided National Health Mission guidelines context. "
+                "CRITICAL: Detect what language the user used to ask the question. If they wrote in Marathi, translate the advice and respond "
+                "in clear, natural Marathi script. If they wrote in Hindi, respond in Hindi. If English, respond in English. Always advise a doctor visit for emergencies."
             )
             prompt = f"Guidelines Context:\n{context_str}\n\nASHA Worker Question: {incoming_text}"
             
@@ -197,17 +211,31 @@ async def receive_whatsapp_message(
                 config={'system_instruction': system_instruction}
             )
             response_message = ai_response.text
-            
             session.last_detected_intent = "STG_MIRROR"
             sqlite_db.commit()
             
         except Exception as e:
             print(f"Gemini Error: {e}")
-            response_message = "नमस्ते आशा दीदी! सर्वर में समस्या के कारण मैं अभी जानकारी नहीं निकाल पा रही हूँ।"
+            response_message = "क्षमस्व, सर्व्हर त्रुटीमुळे मी माहिती मिळवू शकले नाही. कृपया पुन्हा प्रयत्न करा."
 
     # --- ROUTE C: GENERAL CONVERSATIONAL PROCESSING ---
     else:
-        response_message = "नमस्ते आशा दीदी! मैं आपकी आशा सहेली हूँ। आज काम के रिकॉर्ड्स या इंसेंटिव ट्रैकिंग में मैं आपकी क्या मदद करूँ?"
+        try:
+            client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+            general_instruction = (
+                "You are Asha Saheli, a helpful AI workflow companion for rural health workers. Greeting them warmly. "
+                "Detect the language of their message. If it is Marathi, reply in Marathi. If Hindi, reply in Hindi. If English, reply in English. "
+                "Ask how you can assist them with task tracking or incentive tracking today."
+            )
+            ai_gen_res = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=incoming_text,
+                config={'system_instruction': general_instruction}
+            )
+            response_message = ai_gen_res.text
+        except Exception:
+            response_message = "नमस्ते आशा दीदी! मी तुमची आशा सहेली. आज कामाची नोंदणी किंवा इन्सेंटिव्ह ट्रॅकिंगमध्ये मी तुम्हाला कशी मदत करू?"
+            
         session.last_detected_intent = "GENERAL"
         sqlite_db.commit()
 
